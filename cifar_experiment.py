@@ -27,98 +27,6 @@ class CIFARDataset(Dataset):
             'label': self.labels[idx]
         }
 
-def create_cifar_imbalanced_datasets():
-    """Create CIFAR-10 with imbalanced distribution across nodes"""
-    
-    print("Downloading and preparing CIFAR-10 dataset...")
-    
-    # Create data directory
-    os.makedirs('cifar_data', exist_ok=True)
-    
-    # Download CIFAR-10
-    transform = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
-    ])
-    
-    full_dataset = torchvision.datasets.CIFAR10(
-        root='./cifar_data', train=True, download=True, transform=transform
-    )
-    
-    print(f"Full CIFAR-10 dataset size: {len(full_dataset)}")
-    
-    # Create imbalanced splits
-    distributions = {
-        "equal": [16000, 16000, 18000],        # Equal distribution
-        "imbalanced": [30000, 15000, 5000],    # 6:3:1 ratio
-        "extreme": [40000, 8000, 2000]         # 20:4:1 ratio
-    }
-    
-    created_datasets = {}
-    
-    for exp_name, sizes in distributions.items():
-        print(f"\nCreating {exp_name} distribution: {sizes}")
-        
-        # Ensure sizes don't exceed dataset size
-        total_requested = sum(sizes)
-        if total_requested > len(full_dataset):
-            # Scale down proportionally
-            scale_factor = len(full_dataset) / total_requested
-            sizes = [int(s * scale_factor) for s in sizes]
-            # Adjust last element to match exact total
-            sizes[-1] = len(full_dataset) - sum(sizes[:-1])
-            print(f"Adjusted sizes: {sizes}")
-        
-        # Split dataset according to sizes
-        splits = random_split(full_dataset, sizes)
-        
-        # Convert to Ray datasets and save
-        exp_dir = f'cifar_data/{exp_name}'
-        os.makedirs(exp_dir, exist_ok=True)
-        
-        node_datasets = []
-        for i, split in enumerate(splits):
-            # Extract data and labels from the split
-            data_list = []
-            labels_list = []
-            
-            for idx in range(len(split)):
-                sample = split[idx]
-                data_list.append(sample[0])  # Image tensor
-                labels_list.append(sample[1])  # Label
-            
-            # Convert to Ray dataset format
-            ray_data = []
-            for j in range(len(data_list)):
-                ray_data.append({
-                    'image': data_list[j].numpy(),
-                    'label': labels_list[j]
-                })
-            
-            # Create Ray dataset
-            node_dataset = ray.data.from_items(ray_data)
-            node_datasets.append(node_dataset)
-            
-            print(f"  Node {i}: {len(ray_data)} samples")
-        
-        created_datasets[exp_name] = node_datasets
-    
-    return created_datasets, distributions
-
-def load_cifar_experiment_data(experiment_type, datasets_dict):
-    """Load the specific experiment data"""
-    if experiment_type not in datasets_dict:
-        raise ValueError(f"Experiment type {experiment_type} not found")
-    
-    node_datasets = datasets_dict[experiment_type]
-    
-    # Combine all node datasets into one for Ray to distribute
-    combined_dataset = node_datasets[0]
-    for ds in node_datasets[1:]:
-        combined_dataset = combined_dataset.union(ds)
-    
-    return combined_dataset
-
 class ResNet18(nn.Module):
     def __init__(self, num_classes=10):
         super().__init__()
@@ -128,35 +36,100 @@ class ResNet18(nn.Module):
     def forward(self, x):
         return self.resnet(x)
 
-def preprocess_cifar_batch(batch):
-    """Preprocess CIFAR batch for training"""
-    # Convert numpy arrays back to tensors
-    images = torch.stack([torch.from_numpy(img) for img in batch['image']])
-    labels = torch.tensor(batch['label'])
+def train_func_worker_specific(config):
+    """Training function where each worker creates only its portion of data locally"""
     
-    return {
-        'image': images,
-        'label': labels
-    }
-
-def train_func_cifar():
-    """Training function for CIFAR-10 experiment"""
     worker_rank = train.get_context().get_world_rank()
     world_size = train.get_context().get_world_size()
     
-    print(f"Worker {worker_rank}: Starting CIFAR training")
+    print(f"Worker {worker_rank}: Starting worker-specific CIFAR training")
     
-    batch_size = 64
+    # Get experiment type from config instead of environment
+    if 'experiment_type' not in config:
+        raise ValueError("Experiment type not specified in config")
+    experiment_type = config['experiment_type']
     
-    # Get the dataset shard for this worker (returns DataIterator)
-    train_data_shard = train.get_dataset_shard("train")
-    print(f"Worker {worker_rank}: Got data shard (samples will be counted during iteration)")
+    # Define distributions for TRUE imbalance
+    distributions = {
+        "equal": [16000, 16000, 18000],        # Equal distribution
+        "imbalanced": [30000, 15000, 5000],    # 6:3:1 ratio
+        "extreme": [40000, 8000, 2000]         # 20:4:1 ratio
+    }
     
-    # Create data loader directly from DataIterator - NO map_batches!
-    train_dataloader = train_data_shard.iter_torch_batches(
-        batch_size=batch_size,
-        dtypes={'image': torch.float32, 'label': torch.long}
-    )
+    worker_sizes = distributions[experiment_type]
+    my_data_size = worker_sizes[worker_rank] if worker_rank < len(worker_sizes) else 1000
+    
+    print(f"Worker {worker_rank}: Will create {my_data_size} samples for {experiment_type}")
+    
+    # Each worker downloads CIFAR-10 to its own temp directory
+    transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
+    ])
+    
+    try:
+        full_dataset = torchvision.datasets.CIFAR10(
+            root=f'/tmp/cifar_data_worker_{worker_rank}', 
+            train=True, 
+            download=True, 
+            transform=transform
+        )
+        print(f"Worker {worker_rank}: Downloaded CIFAR-10 with {len(full_dataset)} samples")
+    except Exception as e:
+        print(f"Worker {worker_rank}: Error downloading CIFAR-10: {e}")
+        # Fallback to synthetic data
+        print(f"Worker {worker_rank}: Using synthetic data instead")
+        worker_data = []
+        for i in range(my_data_size):
+            worker_data.append({
+                'image': np.random.randn(3, 32, 32).astype(np.float32),
+                'label': i % 10
+            })
+        
+        worker_dataset = ray.data.from_items(worker_data)
+        train_dataloader = worker_dataset.iter_torch_batches(
+            batch_size=64,
+            dtypes={'image': torch.float32, 'label': torch.long}
+        )
+        
+        # Continue with synthetic data...
+        full_dataset = None
+    
+    if full_dataset is not None:
+        # Create worker-specific data by deterministic sampling
+        # Use worker_rank as seed to ensure different but reproducible data per worker
+        import random
+        random.seed(worker_rank * 1000 + hash(experiment_type))  # Different seed per worker per experiment
+        
+        # Sample exactly the amount this worker should process
+        available_samples = len(full_dataset)
+        actual_size = min(my_data_size, available_samples)
+        
+        if actual_size < available_samples:
+            indices = random.sample(range(available_samples), actual_size)
+        else:
+            indices = list(range(available_samples))
+        
+        print(f"Worker {worker_rank}: Sampling {len(indices)} indices from {available_samples} available")
+        
+        worker_data = []
+        for idx in indices:
+            image, label = full_dataset[idx]
+            worker_data.append({
+                'image': image.numpy(),
+                'label': int(label)
+            })
+        
+        print(f"Worker {worker_rank}: Created {len(worker_data)} samples")
+        
+        # Convert to Ray dataset for this worker only
+        worker_dataset = ray.data.from_items(worker_data)
+        
+        # Create dataloader
+        train_dataloader = worker_dataset.iter_torch_batches(
+            batch_size=64,
+            dtypes={'image': torch.float32, 'label': torch.long}
+        )
     
     # Model setup
     model = ResNet18()
@@ -167,8 +140,8 @@ def train_func_cifar():
     total_batches = 0
     total_samples = 0
     
-    # Training loop
-    for epoch in range(5):
+    # Training loop - fewer epochs for experiment
+    for epoch in range(3):
         epoch_start = time.time()
         epoch_batches = 0
         epoch_samples = 0
@@ -177,7 +150,6 @@ def train_func_cifar():
         print(f"Worker {worker_rank}: Starting epoch {epoch + 1}")
         
         for batch_idx, batch in enumerate(train_dataloader):
-            # Handle preprocessing in the loop
             inputs = batch['image']
             labels = batch['label']
             
@@ -196,28 +168,29 @@ def train_func_cifar():
             running_loss += loss.item()
             epoch_batches += 1
             total_batches += 1
-            batch_size_actual = inputs.shape[0]
-            epoch_samples += batch_size_actual
-            total_samples += batch_size_actual
+            epoch_samples += inputs.shape[0]
+            total_samples += inputs.shape[0]
             
-            if batch_idx % 50 == 0:
+            if batch_idx % 100 == 0:
                 print(f"Worker {worker_rank}: Epoch {epoch+1}, Batch {batch_idx}, Loss: {loss.item():.4f}")
         
         epoch_time = time.time() - epoch_start
         avg_loss = running_loss / epoch_batches if epoch_batches > 0 else 0
         
-        print(f"Worker {worker_rank}: Epoch {epoch+1} completed - {epoch_samples} samples, {epoch_time:.2f}s, avg_loss: {avg_loss:.4f}")
+        print(f"Worker {worker_rank}: Epoch {epoch+1} completed - {epoch_samples} samples, {epoch_time:.2f}s")
         
+        # Report metrics
         train.report({
             f"worker_{worker_rank}_epoch_{epoch}_time": epoch_time,
             f"worker_{worker_rank}_epoch_{epoch}_samples": epoch_samples,
-            f"worker_{worker_rank}_epoch_{epoch}_batches": epoch_batches,
             f"worker_{worker_rank}_epoch_{epoch}_loss": avg_loss
         })
     
     total_time = time.time() - start_time
-    print(f"Worker {worker_rank}: Training completed - {total_samples} samples, {total_time:.2f}s")
     
+    print(f"Worker {worker_rank}: Training completed - {total_samples} samples in {total_time:.2f}s")
+    
+    # Final report
     train.report({
         f"worker_{worker_rank}_total_time": total_time,
         f"worker_{worker_rank}_total_samples": total_samples,
@@ -225,23 +198,25 @@ def train_func_cifar():
         f"worker_{worker_rank}_samples_per_second": total_samples / total_time if total_time > 0 else 0
     })
 
-def run_cifar_experiment(experiment_type, datasets_dict, distributions):
-    """Run CIFAR experiment with specified data distribution"""
+def run_worker_specific_experiment(experiment_type, distributions):
+    """Run experiment with TRUE worker-specific data distribution"""
+    
     print(f"\n{'='*60}")
-    print(f"Running CIFAR-10 experiment: {experiment_type}")
-    print(f"Data distribution: {distributions[experiment_type]}")
+    print(f"Running Worker-Local CIFAR-10 experiment: {experiment_type}")
+    print(f"TRUE data distribution: {distributions[experiment_type]}")
     print(f"{'='*60}")
     
-    # Load experiment data
-    dataset = load_cifar_experiment_data(experiment_type, datasets_dict)
+    # Remove environment variable - pass through config instead
+    # os.environ['EXPERIMENT_TYPE'] = experiment_type
     
-    # Create trainer
+    # Create trainer with train_loop_config
     trainer = TorchTrainer(
-        train_func_cifar,
-        datasets={"train": dataset},
+        train_func_worker_specific,
+        train_loop_config={'experiment_type': experiment_type},  # Pass through config
         scaling_config=ScalingConfig(
-            num_workers=15,  # 3 workers to match the 3 data splits
-            use_gpu=False   # Set to True if you have GPUs
+            num_workers=3,
+            use_gpu=False,
+            resources_per_worker={"CPU": 4},
         )
     )
     
@@ -251,68 +226,88 @@ def run_cifar_experiment(experiment_type, datasets_dict, distributions):
     
     print(f"Total experiment time: {total_time:.2f}s")
     
-    # Analyze results
-    analyze_cifar_results(result, experiment_type, total_time, distributions[experiment_type])
-    
+    # Analyze true imbalance results
+    analyze_worker_specific_results(result, experiment_type, total_time, distributions[experiment_type])
     return result
 
-def analyze_cifar_results(result, experiment_type, total_time, distribution):
-    """Analyze results from CIFAR experiment"""
+def analyze_worker_specific_results(result, experiment_type, total_time, true_distribution):
+    """Analyze results showing TRUE data imbalance effects"""
+    
     metrics = result.metrics
     
-    print(f"\n--- Results for {experiment_type} ---")
-    print(f"Data distribution: {distribution}")
+    print(f"\n--- TRUE IMBALANCE Results for {experiment_type} ---")
+    print(f"Intended distribution: {true_distribution}")
     print(f"Total experiment time: {total_time:.2f}s")
     
     worker_data = []
+    actual_samples = []
     
-    # Extract worker metrics
     for i in range(3):
         worker_info = {
             'worker': i,
             'total_time': metrics.get(f"worker_{i}_total_time", 0),
             'total_samples': metrics.get(f"worker_{i}_total_samples", 0),
-            'samples_per_second': metrics.get(f"worker_{i}_samples_per_second", 0)
+            'samples_per_second': metrics.get(f"worker_{i}_samples_per_second", 0),
+            'intended_samples': true_distribution[i] if i < len(true_distribution) else 0
         }
         worker_data.append(worker_info)
+        actual_samples.append(worker_info['total_samples'])
     
-    # Print worker statistics
-    print("\nWorker Performance:")
+    print(f"Actual sample distribution: {actual_samples}")
+    
+    # Verify true imbalance was achieved
+    print("\nWorker Performance (TRUE IMBALANCE):")
     for worker in worker_data:
         if worker['total_time'] > 0:
-            print(f"  Worker {worker['worker']}: {worker['total_samples']:,} samples, "
+            print(f"  Worker {worker['worker']}: {worker['total_samples']:,} samples "
+                  f"(intended: {worker['intended_samples']:,}), "
                   f"{worker['total_time']:.2f}s, "
                   f"{worker['samples_per_second']:.1f} samples/sec")
     
-    # Calculate imbalance metrics
+    # Calculate TRUE imbalance impact
     times = [w['total_time'] for w in worker_data if w['total_time'] > 0]
     samples = [w['total_samples'] for w in worker_data if w['total_samples'] > 0]
     
     if times and len(times) > 1:
-        print(f"\nImbalance Analysis:")
+        print(f"\nTRUE Imbalance Analysis:")
         print(f"  Time difference: {max(times) - min(times):.2f}s")
-        print(f"  Sample distribution: {samples}")
+        print(f"  Slowest worker: {max(times):.2f}s")
+        print(f"  Fastest worker: {min(times):.2f}s")
         print(f"  Training efficiency: {min(times)/max(times)*100:.1f}%")
         print(f"  Stragglers overhead: {(max(times) - min(times))/max(times)*100:.1f}%")
+        
+        # Calculate theoretical vs actual speedup loss
+        if all(times) and all(samples):
+            total_samples = sum(samples)
+            total_throughput = sum([s/t for s, t in zip(samples, times)])
+            ideal_time = total_samples / total_throughput if total_throughput > 0 else 0
+            actual_time = max(times)
+            speedup_loss = (actual_time - ideal_time) / ideal_time * 100 if ideal_time > 0 else 0
+            print(f"  Speedup loss due to imbalance: {speedup_loss:.1f}%")
 
 def main():
-    """Main function to run CIFAR experiments"""
+    """Main function for worker-local TRUE imbalance experiment"""
+    
     ray.init(ignore_reinit_error=True)
     
     try:
-        # Step 1: Create imbalanced datasets
-        print("Step 1: Creating imbalanced CIFAR-10 datasets...")
-        datasets_dict, distributions = create_cifar_imbalanced_datasets()
-        print(datasets_dict.keys())
-        print(distributions.keys())
+        # Define distributions (no file creation needed - workers create data locally)
+        distributions = {
+            "equal": [16000, 16000, 18000],        # Equal distribution
+            "imbalanced": [30000, 15000, 5000],    # 6:3:1 ratio
+            "extreme": [40000, 8000, 2000]         # 20:4:1 ratio
+        }
         
-        # Step 2: Run experiments
-        print("\nStep 2: Running experiments...")
+        print(f"Defined distributions: {list(distributions.keys())}")
+        print("Workers will create data locally - no file distribution needed!")
+        
+        # Run experiments with TRUE imbalance
+        print("\nStep 1: Running TRUE imbalance experiments...")
         results = {}
         
         for exp_type in ["equal", "imbalanced", "extreme"]:
             try:
-                result = run_cifar_experiment(exp_type, datasets_dict, distributions)
+                result = run_worker_specific_experiment(exp_type, distributions)
                 results[exp_type] = result
                 print(f"✓ {exp_type} experiment completed successfully")
             except Exception as e:
@@ -320,27 +315,31 @@ def main():
                 import traceback
                 traceback.print_exc()
         
-        # Step 3: Comparative analysis
+        # Step 2: Comparative analysis showing TRUE imbalance effects
         print("\n" + "="*60)
-        print("COMPARATIVE ANALYSIS")
+        print("COMPARATIVE ANALYSIS - TRUE DATA IMBALANCE")
         print("="*60)
         
         for exp_type, result in results.items():
             distribution = distributions[exp_type]
             print(f"\n{exp_type.upper()}: {distribution}")
             
-            # Extract key metrics for comparison
             metrics = result.metrics
             worker_times = []
+            worker_samples = []
+            
             for i in range(3):
                 time_key = f"worker_{i}_total_time"
+                samples_key = f"worker_{i}_total_samples"
                 if time_key in metrics:
                     worker_times.append(metrics[time_key])
+                    worker_samples.append(metrics[samples_key])
             
             if worker_times:
                 efficiency = min(worker_times)/max(worker_times)*100
                 print(f"  Efficiency: {efficiency:.1f}%")
                 print(f"  Time spread: {max(worker_times) - min(worker_times):.2f}s")
+                print(f"  Sample spread: {worker_samples}")
         
     except Exception as e:
         print(f"Experiment failed: {e}")
@@ -351,4 +350,4 @@ def main():
         ray.shutdown()
 
 if __name__ == "__main__":
-    main() 
+    main()
