@@ -53,7 +53,7 @@ spec:
           resources:
             limits:
               cpu: 5
-              memory: 10G
+              memory: 30G
             requests:
               cpu: 5
-              memory: 10G
+              memory: 30G
